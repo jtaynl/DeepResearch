@@ -34,6 +34,57 @@ For each function call, return a json object with function name and arguments wi
 
 Current date: """
 
+LGI_SUPPLEMENT = """
+
+# Domain-Specific Instructions: Logistics Growth Index (LGI) Prediction
+
+You are researching logistics market conditions to predict a specific LGI metric direction. Follow these rules strictly:
+
+## Output Format
+Your final <answer> MUST use this exact structure:
+
+**Verdict: [Higher / No Change / Lower]**
+
+**Confidence: [High / Medium / Low]**
+
+**Summary:**
+[2-3 sentence summary of the key evidence driving the verdict]
+
+**Key Evidence:**
+1. [Finding 1] - Source: [Publication Name], [URL], published [Date]
+2. [Finding 2] - Source: [Publication Name], [URL], published [Date]
+3. [Finding 3] - Source: [Publication Name], [URL], published [Date]
+
+**Reasoning:**
+[Detailed analysis connecting evidence to the verdict, explaining why the metric is expected to move in the stated direction compared to the prior month]
+
+## Research Guidelines
+- Focus ONLY on data and reports published within the date window specified in the question.
+- Prioritize official government statistics, central bank reports, major logistics company earnings/announcements, and reputable business media (Reuters, Bloomberg, Nikkei Asia, Straits Times, Channel NewsAsia, Financial Times, etc.).
+- EXCLUDE non-credible sources: RTTNews.com, auto-generated press release aggregators, or sites that republish unverified wire content.
+- EXCLUDE any source that claims to already have the official LGI results for the month being predicted. These are fabricated or premature.
+- Every factual claim must include an explicit URL citation with publication date.
+- Use targeted search queries combining the country name with logistics/trade/shipping terms and the specific metric (e.g., "Singapore container throughput January February 2026", "China PMI logistics sector 2026").
+- Search in both English and the local language of the target country where applicable.
+- Consider related indicators as proxies: PMI data, port throughput statistics, trade balance figures, shipping cost indices, freight rate trends, and major logistics company announcements.
+- When evidence is mixed or insufficient, lean toward "No Change" and state the confidence as Low.
+"""
+
+
+def build_system_prompt(question: str = "") -> str:
+    """Build system prompt, appending LGI supplement when question is LGI-related."""
+    base = SYSTEM_PROMPT
+    if _is_lgi_question(question):
+        base += LGI_SUPPLEMENT
+    return base
+
+
+def _is_lgi_question(question: str) -> bool:
+    """Detect if a question is about LGI prediction."""
+    q_lower = question.lower()
+    return "logistics growth index" in q_lower or "lgi" in q_lower
+
+
 EXTRACTOR_PROMPT = """Please process the following webpage content and user goal to extract relevant information:
 
 ## **Webpage Content** 

@@ -8,6 +8,7 @@ import http.client
 
 
 SERPER_KEY=os.environ.get('SERPER_KEY_ID')
+SCHOLAR_YEAR_FROM = os.environ.get('SCHOLAR_YEAR_FROM', '')
 
 
 @register_tool("google_scholar", allow_overwrite=True)
@@ -29,9 +30,10 @@ class Scholar(BaseTool):
 
     def google_scholar_with_serp(self, query: str):
         conn = http.client.HTTPSConnection("google.serper.dev")
-        payload = json.dumps({
-        "q": query,
-        })
+        payload_dict = {"q": query}
+        if SCHOLAR_YEAR_FROM:
+            payload_dict["as_ylo"] = SCHOLAR_YEAR_FROM
+        payload = json.dumps(payload_dict)
         headers = {
         'X-API-KEY': SERPER_KEY,
         'Content-Type': 'application/json'

@@ -13,6 +13,8 @@ import os
 
 
 SERPER_KEY=os.environ.get('SERPER_KEY_ID')
+SEARCH_DATE_RANGE = os.environ.get('SEARCH_DATE_RANGE', '')
+SEARCH_NUM_RESULTS = int(os.environ.get('SEARCH_NUM_RESULTS', '10'))
 
 
 @register_tool("search", allow_overwrite=True)
@@ -40,20 +42,24 @@ class Search(BaseTool):
             return any('\u4E00' <= char <= '\u9FFF' for char in text)
         conn = http.client.HTTPSConnection("google.serper.dev")
         if contains_chinese_basic(query):
-            payload = json.dumps({
+            payload_dict = {
                 "q": query,
                 "location": "China",
                 "gl": "cn",
                 "hl": "zh-cn"
-            })
-            
+            }
         else:
-            payload = json.dumps({
+            payload_dict = {
                 "q": query,
                 "location": "United States",
                 "gl": "sg",
                 "hl": "en"
-            })
+            }
+        if SEARCH_DATE_RANGE:
+            payload_dict["tbs"] = SEARCH_DATE_RANGE
+        if SEARCH_NUM_RESULTS != 10:
+            payload_dict["num"] = SEARCH_NUM_RESULTS
+        payload = json.dumps(payload_dict)
         headers = {
                 'X-API-KEY': SERPER_KEY,
                 'Content-Type': 'application/json'

@@ -132,7 +132,7 @@ class MultiTurnReactAgent(FnCallAgent):
         answer = data['item'].get('answer', "")
         self.user_prompt = question
 
-        system_prompt = SYSTEM_PROMPT + today_date()
+        system_prompt = build_system_prompt(question) + today_date()
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": question},
