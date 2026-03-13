@@ -51,7 +51,7 @@ class Search(BaseTool):
             payload = json.dumps({
                 "q": query,
                 "location": "United States",
-                "gl": "us",
+                "gl": "sg",
                 "hl": "en"
             })
         headers = {

@@ -235,13 +235,9 @@ if __name__ == "__main__":
         "turns_dist": turns_dist
     }
     print(report)
-    base, _ = os.path.splitext(input_fp)
-    eval_details_path = base + '.eval_details.jsonl'
-    report_path = base + '.report.json'
-    # (paranoia) ensure the folder exists
-    os.makedirs(os.path.dirname(eval_details_path), exist_ok=True)
+    eval_details_path = input_fp.replace('.jsonl', '.eval_details.jsonl')
     write_jsonl(res, eval_details_path)
+    report_path = input_fp.replace('.jsonl', '.report.json')
     with open(report_path, 'w') as f:
         json.dump(report, f, indent=4)
-    
     

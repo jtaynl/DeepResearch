@@ -1,141 +1,251 @@
-"""
-input:
-    - query/goal: str
-    - Docs: List[file]/List[url]
-    - file type: 'pdf', 'docx', 'pptx', 'txt', 'html', 'csv', 'tsv', 'xlsx', 'xls', 'doc', 'zip', '.mp4', '.mov', '.avi', '.mkv', '.webm', '.mp3', '.wav', '.aac', '.ogg', '.flac'
-output:
-    - answer: str
-    - useful_information: str
-"""
+# inference/tool_file.py
 import sys
 import os
-import re
-import time
-import copy
 import json
-from typing import Dict, Iterator, List, Literal, Tuple, Union, Any, Optional
-import json5
-import asyncio
-from openai import OpenAI, AsyncOpenAI
-import pdb
-import bdb
+import tempfile
+from typing import List, Any, Tuple
+import requests
 
-from qwen_agent.tools.base import BaseTool, register_tool
-from qwen_agent.agents import Assistant
-from qwen_agent.llm import BaseChatModel
-from qwen_agent.settings import DEFAULT_WORKSPACE, DEFAULT_MAX_INPUT_TOKENS
-from qwen_agent.llm.schema import ASSISTANT, USER, FUNCTION, Message, DEFAULT_SYSTEM_MESSAGE, SYSTEM, ROLE
-from qwen_agent.tools import BaseTool
-from qwen_agent.log import logger
-from qwen_agent.utils.tokenization_qwen import count_tokens, tokenizer
-from qwen_agent.settings import DEFAULT_WORKSPACE, DEFAULT_MAX_INPUT_TOKENS
+from qwen_agent.tools.base import BaseTool
+from qwen_agent.settings import DEFAULT_MAX_INPUT_TOKENS
+from qwen_agent.utils.tokenization_qwen import count_tokens
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.dirname(current_dir)) 
-sys.path.append('../../')  
+sys.path.append(os.path.dirname(current_dir))
+sys.path.append('../../')
 
 from file_tools.file_parser import SingleFileParser, compress
 from file_tools.video_agent import VideoAgent
 
-FILE_SUMMARY_PROMPT = """
-Please process the following file content and user goal to extract relevant information:
+TABULAR_EXTS = {".xlsx", ".xls", ".csv", ".tsv"}
+ALWAYS_INCLUDE_TABULAR_PREVIEW = os.getenv("ALWAYS_INCLUDE_TABULAR_PREVIEW", "1").lower() in ("1", "true", "yes")
+TABULAR_PREVIEW_LIMIT_CHARS = int(os.getenv("TABULAR_PREVIEW_LIMIT_CHARS", "8000"))
 
-## **File Content** 
-{file_content}
+def _is_url(path: str) -> bool:
+    return isinstance(path, str) and path.lower().startswith(("http://", "https://"))
 
-## **User Goal**
-{goal}
+def _ext(path: str) -> str:
+    base = path.split('?', 1)[0]
+    return os.path.splitext(base)[1].lower()
 
-## **Task Guidelines**
-1. **Content Scanning for Rational**: Locate the **specific sections/data** directly related to the user's goal within the file content
-2. **Key Extraction for Evidence**: Identify and extract the **most relevant information** from the content, you never miss any important information, output the **full original context** of the content as far as possible, it can be more than three paragraphs.
-3. **Summary Output for Summary**: Organize into a concise paragraph with logical flow, prioritizing clarity and judge the contribution of the information to the goal.
-""".strip()
+def _looks_like_waf_html(data: bytes) -> bool:
+    head = data[:4096].decode('utf-8', errors='ignore')
+    return ("_Incapsula_Resource" in head) or ("incapsula" in head.lower()) or ("imperva" in head.lower())
 
+def _is_pdf_bytes(data: bytes) -> bool:
+    return data.startswith(b"%PDF-")
+
+def _is_zip_bytes(data: bytes) -> bool:
+    # XLSX are Zip containers (PK..)
+    return data.startswith(b"PK\x03\x04")
+
+def _download(url: str) -> Tuple[str, bytes]:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+        "Referer": url.split("/content/dam/", 1)[0] if "/content/dam/" in url else url,
+    }
+    r = requests.get(url, headers=headers, timeout=60, allow_redirects=True)
+    r.raise_for_status()
+    return (url, r.content)
+
+def _save_temp(data: bytes, suffix: str) -> str:
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return path
+
+def _xlsx_preview_with_pandas(path: str, max_sheets: int = 6, max_rows: int = 60) -> str:
+    import pandas as pd
+    try:
+        xl = pd.ExcelFile(path)
+    except Exception as e:
+        return f"# Pandas could not open Excel: {e}"
+    out = [f"# Detected {len(xl.sheet_names)} sheet(s): {', '.join(xl.sheet_names[:max_sheets])}"]
+    for sheet in xl.sheet_names[:max_sheets]:
+        try:
+            df = pd.read_excel(xl, sheet_name=sheet, nrows=max_rows)
+            out.append(f"# Sheet: {sheet}\n{df.to_csv(index=False)}")
+        except Exception as e:
+            out.append(f"# Error reading sheet '{sheet}': {e}")
+    return "\n".join(out)
+
+def _xlsx_preview_with_openpyxl(path: str, max_sheets: int = 6, max_rows: int = 60, max_cols: int = 50) -> str:
+    try:
+        from openpyxl import load_workbook
+    except Exception as e:
+        return f"# openpyxl not available: {e}"
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+    except Exception as e:
+        return f"# openpyxl failed to open workbook: {e}"
+    out = [f"# Detected {len(wb.sheetnames)} sheet(s): {', '.join(wb.sheetnames[:max_sheets])}"]
+    for sheet in wb.sheetnames[:max_sheets]:
+        try:
+            ws = wb[sheet]
+            rows_txt = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= max_rows:
+                    break
+                vals = ["" if v is None else str(v) for v in (row or [])[:max_cols]]
+                rows_txt.append("\t".join(vals))
+            out.append(f"# Sheet: {sheet}\n" + "\n".join(rows_txt))
+        except Exception as e:
+            out.append(f"# Error reading sheet '{sheet}': {e}")
+    return "\n".join(out)
+
+def _csv_tsv_preview(path: str, max_lines: int = 200) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = []
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                lines.append(line.rstrip("\n"))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"# Could not read text file: {e}"
+
+def _tabular_preview(path: str) -> str:
+    ext = _ext(path)
+    txt = ""
+    if ext in (".xlsx", ".xls"):
+        try:
+            import pandas  # noqa
+            txt = _xlsx_preview_with_pandas(path)
+        except Exception:
+            txt = _xlsx_preview_with_openpyxl(path)
+    elif ext in (".csv", ".tsv"):
+        txt = _csv_tsv_preview(path)
+    if len(txt) > TABULAR_PREVIEW_LIMIT_CHARS:
+        txt = txt[:TABULAR_PREVIEW_LIMIT_CHARS] + "\n# ... [truncated]"
+    return txt
 
 async def file_parser(params, **kwargs):
-    """Parse files with automatic path resolution"""
-    urls = params.get('files', [])
-    if isinstance(urls, str):
-        urls = [urls]
+    """Accepts local paths or URLs; downloads URLs; validates magic bytes; falls back to HTML when 'PDF' isn't a real PDF."""
+    inputs = params.get('files', [])
+    if isinstance(inputs, str):
+        inputs = [inputs]
 
-    resolved_urls = []
-    for url in urls:
-        if isinstance(url, list):
-            for sub_url in url:
-                if sub_url.startswith(("http://", "https://")):
-                    resolved_urls.append(sub_url)
-                else:
-                    abs_path = os.path.abspath(sub_url)
-                    if os.path.exists(abs_path):
-                        resolved_urls.append(abs_path)
-                    else:
-                        resolved_urls.append(sub_url)
-        else:
-            if url.startswith(("http://", "https://")):
-                resolved_urls.append(url)
-            else:
-                abs_path = os.path.abspath(url)
-                if os.path.exists(abs_path):
-                    resolved_urls.append(abs_path)
-                else:
-                    resolved_urls.append(url)
+    resolved_paths: List[str] = []
+    errors: List[str] = []
 
-    results = []
-    file_results = []
-    for url in resolved_urls:
+    for item in inputs:
         try:
-            result = SingleFileParser().call(json.dumps({'url': url}), **kwargs)
-            results.append(f"# File: {os.path.basename(url)}\n{result}")
+            if _is_url(item):
+                url, data = _download(item)
+
+                ext = _ext(item)
+                # WAF detection for EDB/Imperva
+                if _looks_like_waf_html(data):
+                    errors.append(f"# WAF/Incapsula blocked direct download from {url}. "
+                                  f"Please upload the file locally (eval_data/file_corpus) or provide an accessible mirror.")
+                    continue
+
+                # Validate by magic bytes and fix-up type if needed
+                if ext in (".xlsx", ".xls"):
+                    if not _is_zip_bytes(data):
+                        errors.append(f"# {url} did not return a real Excel (no ZIP header). It might be a guard page.")
+                        continue
+                    path = _save_temp(data, ext or ".xlsx")
+                    resolved_paths.append(path)
+
+                elif ext == ".pdf":
+                    if _is_pdf_bytes(data):
+                        path = _save_temp(data, ".pdf")
+                        resolved_paths.append(path)
+                    else:
+                        # treat as HTML/text instead of exploding
+                        path = _save_temp(data, ".html")
+                        resolved_paths.append(path)
+
+                else:
+                    # generic save
+                    path = _save_temp(data, ext or ".bin")
+                    resolved_paths.append(path)
+            else:
+                abs_path = os.path.abspath(item)
+                if os.path.exists(abs_path):
+                    resolved_paths.append(abs_path)
+                else:
+                    errors.append(f"# Warning: Local path not found: {item}")
+        except Exception as e:
+            errors.append(f"# Error resolving {item}: {e}")
+
+    results: List[str] = []
+    file_results: List[str] = []
+
+    for local_path in resolved_paths:
+        try:
+            result = SingleFileParser().call(json.dumps({'url': local_path}), **kwargs) or ""
+            # Always append a tabular preview for spreadsheets/CSV/TSV
+            if ALWAYS_INCLUDE_TABULAR_PREVIEW and _ext(local_path) in TABULAR_EXTS:
+                preview = _tabular_preview(local_path)
+                if preview:
+                    result += ("\n\n# Tabular preview (local):\n" + preview)
+            results.append(f"# File: {os.path.basename(local_path)}\n{result}")
             file_results.append(result)
         except Exception as e:
-            results.append(f"# Error processing {os.path.basename(url)}: {str(e)}")
+            fb_txt = ""
+            if _ext(local_path) in TABULAR_EXTS:
+                fb_txt = "\n# Tabular preview (local):\n" + _tabular_preview(local_path)
+            results.append(f"# Error processing {os.path.basename(local_path)}: {str(e)}{fb_txt}")
+
+    results.extend(errors)
+
     if count_tokens(json.dumps(results)) < DEFAULT_MAX_INPUT_TOKENS:
         return results
     else:
         return compress(file_results)
 
-# @register_tool("file_parser")
 class FileParser(BaseTool):
     name = "parse_file"
-    description = "This is a tool that can be used to parse multiple user uploaded local files such as PDF, DOCX, PPTX, TXT, CSV, XLSX, DOC, ZIP, MP4, MP3."
+    description = "Parse local or remote files (PDF, DOCX, PPTX, TXT, CSV, XLSX, etc.). Accepts URLs or local paths."
     parameters = [
         {
             'name': 'files',
             'type': 'array',
             'array_type': 'string',
-            'description': 'The file name of the user uploaded local files to be parsed.',
+            'description': 'File paths or URLs to parse.',
             'required': True
         }
     ]
 
     async def call(self, params, file_root_path):
-        file_name = params["files"]
-        outputs = []
-        
-        file_path = []
-        omnifile_path = []
-        for f_name in file_name:
-            if '.mp3' not in f_name:
-                file_path.append(os.path.join(file_root_path, f_name))
+        inputs = params.get("files", [])
+        if isinstance(inputs, str):
+            inputs = [inputs]
+
+        local_candidates: List[str] = []
+        remote_or_abs: List[str] = []
+
+        for f_name in inputs:
+            if _is_url(f_name):
+                remote_or_abs.append(f_name)
             else:
-                omnifile_path.append(os.path.join(file_root_path, f_name))
+                if os.path.isabs(f_name):
+                    remote_or_abs.append(f_name)
+                else:
+                    local_candidates.append(os.path.join(file_root_path, f_name))
 
-        if len(file_path):
-            params = {'files': file_path}
-            response = await file_parser(params)
-            response = response[:30000]
+        outputs: List[Any] = []
 
-            parsed_file_content = ' '.join(response)
-            outputs.extend([f'File token number: {len(parsed_file_content.split())}\nFile content:\n']+response)
+        if local_candidates:
+            try:
+                resp = await file_parser({'files': local_candidates})
+                resp = resp[:30000]
+                parsed = ' '.join(resp)
+                outputs.extend([f'File token number: {len(parsed.split())}\nFile content:\n'] + resp)
+            except Exception as e:
+                outputs.append(f"# Error parsing local corpus files: {e}")
 
-        
-        if len(omnifile_path):
-            params['files'] = omnifile_path
-            agent = VideoAgent()
-            res = await agent.call(params)
+        if remote_or_abs:
+            try:
+                resp = await file_parser({'files': remote_or_abs})
+                resp = resp[:30000]
+                parsed = ' '.join(resp)
+                outputs.extend([f'File token number: {len(parsed.split())}\nFile content:\n'] + resp)
+            except Exception as e:
+                outputs.append(f"# Error parsing remote/absolute files: {e}")
 
-            res = json.loads(res)
-            outputs += res
-        
         return outputs
