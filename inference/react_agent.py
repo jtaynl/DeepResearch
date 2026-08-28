@@ -79,7 +79,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 r = client.chat.completions.create(
                     model=(self.model or "alibaba/tongyi-deepresearch-30b-a3b"),
                     messages=msgs,
-                    stop=["\n<tool_response>", "<tool_response>"],
+                    stop=["\n<tool_response>", "<tool_response>", "</tool_call>"],
                     temperature=self.llm_generate_cfg.get('temperature', 0.6),
                     top_p=self.llm_generate_cfg.get('top_p', 0.95),
                     max_tokens=10000,
@@ -156,6 +156,15 @@ class MultiTurnReactAgent(FnCallAgent):
             if OBS_START in content:
                 content = content.split(OBS_START, 1)[0]
 
+            # The "</tool_call>" stop sequence is excluded from the output, and
+            # some models keep generating past their first tool call (more calls,
+            # a speculative <answer>) without ever seeing a tool result. Restore
+            # the closing tag if cut, then drop everything after the first call.
+            if '<tool_call>' in content:
+                if '</tool_call>' not in content:
+                    content = content.rstrip() + '\n</tool_call>'
+                content = content.split('</tool_call>', 1)[0] + '</tool_call>'
+
             messages.append({"role": "assistant", "content": content.strip()})
 
             if '<tool_call>' in content and '</tool_call>' in content:
@@ -171,6 +180,15 @@ class MultiTurnReactAgent(FnCallAgent):
                         payload = json5.loads(block)
                         tool_name = payload.get('name', '')
                         tool_args = payload.get('arguments', {}) or {}
+                        # Non-Tongyi models often emit stringified or flattened
+                        # arguments ({"name": ..., "query": ...}); accept both.
+                        if isinstance(tool_args, str):
+                            try:
+                                tool_args = json5.loads(tool_args) or {}
+                            except Exception:
+                                tool_args = {}
+                        if not isinstance(tool_args, dict) or not tool_args:
+                            tool_args = {k: v for k, v in payload.items() if k != 'name'}
 
                         # Smart reroute for binary URLs
                         if tool_name == "visit":

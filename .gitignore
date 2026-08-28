@@ -148,3 +148,5 @@ cache/
 models/
 outputs/
 checkpoints/
+# qwen_agent file-parser runtime cache
+workspace/
